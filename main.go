@@ -25,6 +25,8 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 )
 
+// Build BPF object first, for example:
+// clang -O2 -g -target bpf -c bpf/flow.c -o bpf/flow.o
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror" flow ./bpf/flow.c -- -I/usr/include
 
 type crictlPS struct {
@@ -61,6 +63,8 @@ type assoc struct {
 }
 
 type attachRef struct {
+	col *ebpf.Collection
+	egr link.Link
 	objs *flowObjects
 	egr  link.Link
 }
@@ -140,6 +144,7 @@ func (m *manager) sync(as []assoc) {
 			continue
 		}
 		_ = ref.egr.Close()
+		_ = ref.col.Close()
 		_ = ref.objs.Close()
 		m.mu.Lock()
 		delete(m.refs, k)
@@ -148,6 +153,14 @@ func (m *manager) sync(as []assoc) {
 }
 
 func (m *manager) attach(a assoc) error {
+	col, prog, err := loadEgressProgram(m.slot(a.Identity), m.rbMap)
+	if err != nil {
+		return err
+	}
+
+	egr, err := link.AttachCgroup(link.CgroupOptions{Path: a.Cgroup, Attach: ebpf.AttachCGroupInetEgress, Program: prog})
+	if err != nil {
+		_ = col.Close()
 	spec, err := loadFlow()
 	if err != nil {
 		return err
@@ -168,6 +181,7 @@ func (m *manager) attach(a assoc) error {
 	}
 
 	m.mu.Lock()
+	m.refs[a.Identity+"|"+a.Cgroup] = &attachRef{col: col, egr: egr}
 	m.refs[a.Identity+"|"+a.Cgroup] = &attachRef{objs: &objs, egr: egr}
 	m.mu.Unlock()
 
@@ -180,6 +194,7 @@ func (m *manager) close() {
 	defer m.mu.Unlock()
 	for _, ref := range m.refs {
 		_ = ref.egr.Close()
+		_ = ref.col.Close()
 		_ = ref.objs.Close()
 	}
 }
@@ -291,6 +306,30 @@ func main() {
 		m.Packets++
 		m.Bytes += uint64(e.PktLen)
 	}
+}
+
+func loadEgressProgram(identitySlot uint32, sharedEvents *ebpf.Map) (*ebpf.Collection, *ebpf.Program, error) {
+	spec, err := ebpf.LoadCollectionSpec("bpf/flow.o")
+	if err != nil {
+		return nil, nil, fmt.Errorf("load bpf object bpf/flow.o: %w", err)
+	}
+	if err := spec.RewriteConstants(map[string]any{"image_slot": identitySlot}); err != nil {
+		return nil, nil, fmt.Errorf("rewrite image_slot constant: %w", err)
+	}
+
+	col, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
+		MapReplacements: map[string]*ebpf.Map{"events": sharedEvents},
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("create bpf collection: %w", err)
+	}
+
+	prog, ok := col.Programs["cgroup_egress"]
+	if !ok {
+		_ = col.Close()
+		return nil, nil, errors.New("cgroup_egress program not found in bpf object")
+	}
+	return col, prog, nil
 }
 
 func discover() ([]assoc, error) {
