@@ -15,7 +15,9 @@ Dynamic cgroup eBPF flow tracer in Go.
 
 ```bash
 go mod tidy
-clang -O2 -g -target bpf -c bpf/flow.c -o bpf/flow.o
+
+go generate ./...
+
 go build -o cgflow .
 ```
 

@@ -27,6 +27,7 @@ import (
 
 // Build BPF object first, for example:
 // clang -O2 -g -target bpf -c bpf/flow.c -o bpf/flow.o
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror" flow ./bpf/flow.c -- -I/usr/include
 
 type crictlPS struct {
 	Containers []struct {
@@ -64,6 +65,8 @@ type assoc struct {
 type attachRef struct {
 	col *ebpf.Collection
 	egr link.Link
+	objs *flowObjects
+	egr  link.Link
 }
 
 type flowKey struct {
@@ -142,6 +145,7 @@ func (m *manager) sync(as []assoc) {
 		}
 		_ = ref.egr.Close()
 		_ = ref.col.Close()
+		_ = ref.objs.Close()
 		m.mu.Lock()
 		delete(m.refs, k)
 		m.mu.Unlock()
@@ -157,11 +161,28 @@ func (m *manager) attach(a assoc) error {
 	egr, err := link.AttachCgroup(link.CgroupOptions{Path: a.Cgroup, Attach: ebpf.AttachCGroupInetEgress, Program: prog})
 	if err != nil {
 		_ = col.Close()
+	spec, err := loadFlow()
+	if err != nil {
+		return err
+	}
+	if err := spec.RewriteConstants(map[string]any{"image_slot": m.slot(a.Identity)}); err != nil {
+		return err
+	}
+
+	objs := flowObjects{}
+	if err := spec.LoadAndAssign(&objs, &ebpf.CollectionOptions{MapReplacements: map[string]*ebpf.Map{"events": m.rbMap}}); err != nil {
+		return err
+	}
+
+	egr, err := link.AttachCgroup(link.CgroupOptions{Path: a.Cgroup, Attach: ebpf.AttachCGroupInetEgress, Program: objs.CgroupEgress})
+	if err != nil {
+		_ = objs.Close()
 		return err
 	}
 
 	m.mu.Lock()
 	m.refs[a.Identity+"|"+a.Cgroup] = &attachRef{col: col, egr: egr}
+	m.refs[a.Identity+"|"+a.Cgroup] = &attachRef{objs: &objs, egr: egr}
 	m.mu.Unlock()
 
 	fmt.Printf("attached egress namespace=%q pod=%q container=%q pid=%d cgroup=%s\n", a.Namespace, a.PodName, a.ContainerName, a.PID, a.Cgroup)
@@ -174,6 +195,7 @@ func (m *manager) close() {
 	for _, ref := range m.refs {
 		_ = ref.egr.Close()
 		_ = ref.col.Close()
+		_ = ref.objs.Close()
 	}
 }
 
